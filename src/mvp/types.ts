@@ -1,6 +1,8 @@
 export type RunStatus =
   | 'PLANNING'
   | 'AWAITING_PLAN_APPROVAL'
+  | 'PLAN_APPROVED'
+  | 'PLAN_REJECTED'
   | 'IMPLEMENTING'
   | 'VERIFYING'
   | 'VERIFICATION_FAILED'
@@ -75,8 +77,18 @@ export interface ReviewResult {
   }>;
 }
 
+export interface PlanApproval {
+  decision: 'approved' | 'rejected';
+  actor: string;
+  note?: string;
+  decidedAt: string;
+  planHash: string;
+  profileHash: string;
+  baseSha: string;
+}
+
 export interface RunRecord {
-  version: 1;
+  version: 1 | 2;
   id: string;
   projectPath: string;
   profilePath: string;
@@ -89,6 +101,7 @@ export interface RunRecord {
   status: RunStatus;
   task: TaskInput;
   plan?: string;
+  approval?: PlanApproval;
   implementationSummary?: string;
   changedPaths?: string[];
   setupChecks?: CheckResult[];

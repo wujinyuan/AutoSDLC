@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { chmod, mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
@@ -25,12 +26,16 @@ class FakeAgent implements AgentRunner {
     if (request.phase === 'implement') {
       await mkdir(path.join(request.workspace, 'src'), { recursive: true });
       await writeFile(path.join(request.workspace, 'src', 'value.txt'), 'ready\n', 'utf8');
-      return { output: 'Implemented src/value.txt.', command: ['fake-agent', 'implement'] };
+      return {
+        output: 'Implemented src/value.txt.',
+        command: ['fake-agent', 'implement'],
+      };
     }
     return {
       output: JSON.stringify({
         verdict: this.reviewVerdict,
-        summary: this.reviewVerdict === 'pass' ? 'Change satisfies the task.' : 'Change needs work.',
+        summary:
+          this.reviewVerdict === 'pass' ? 'Change satisfies the task.' : 'Change needs work.',
         findings:
           this.reviewVerdict === 'pass'
             ? []
@@ -75,13 +80,17 @@ describe('AutoSdlcWorkflow MVP', () => {
     profilePath = path.join(temporaryRoot, 'profile.json');
     await mkdir(projectPath);
     await requireSuccess('git', ['init', '-b', 'main'], { cwd: projectPath });
-    await requireSuccess('git', ['config', 'user.name', 'AutoSDLC Test'], { cwd: projectPath });
+    await requireSuccess('git', ['config', 'user.name', 'AutoSDLC Test'], {
+      cwd: projectPath,
+    });
     await requireSuccess('git', ['config', 'user.email', 'autosdlc@example.test'], {
       cwd: projectPath,
     });
     await writeFile(path.join(projectPath, 'README.md'), '# Fixture\n', 'utf8');
     await requireSuccess('git', ['add', 'README.md'], { cwd: projectPath });
-    await requireSuccess('git', ['commit', '-m', 'fixture'], { cwd: projectPath });
+    await requireSuccess('git', ['commit', '-m', 'fixture'], {
+      cwd: projectPath,
+    });
     profile = {
       version: 1,
       name: 'fixture',
@@ -112,7 +121,9 @@ describe('AutoSdlcWorkflow MVP', () => {
       .map((line) => line.slice('worktree '.length))
       .filter((worktree) => path.resolve(worktree) !== path.resolve(canonicalProject));
     for (const worktree of linked) {
-      await requireSuccess('git', ['worktree', 'remove', '--force', worktree], { cwd: projectPath });
+      await requireSuccess('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: projectPath,
+      });
     }
     await rm(temporaryRoot, { recursive: true, force: true });
   });
@@ -183,6 +194,173 @@ describe('AutoSdlcWorkflow MVP', () => {
     await expect(workflow.continue(planned.id, false)).rejects.toThrow('Plan approval is required');
   });
 
+  test('records a human approval separately before implementation', async () => {
+    const stateDir = path.join(temporaryRoot, 'state');
+    const workflow = new AutoSdlcWorkflow({
+      projectPath,
+      profilePath,
+      stateDir,
+      agentFactory: () => new FakeAgent(),
+    });
+    const planned = await workflow.start(task);
+    const approved = await workflow.approvePlan(
+      planned.id,
+      'Alice Reviewer',
+      'Scope is acceptable.'
+    );
+    expect(approved.status).toBe('PLAN_APPROVED');
+    expect(approved.approval).toMatchObject({
+      decision: 'approved',
+      actor: 'Alice Reviewer',
+      note: 'Scope is acceptable.',
+      baseSha: approved.baseSha,
+      profileHash: approved.profileHash,
+    });
+    expect(approved.approval?.planHash).toHaveLength(64);
+    const artifact = JSON.parse(
+      await readFile(path.join(stateDir, 'runs', approved.id, 'approval.json'), 'utf8')
+    );
+    expect(artifact.actor).toBe('Alice Reviewer');
+    expect((await workflow.continue(approved.id, false)).status).toBe('READY_FOR_PR');
+  });
+
+  test('records a rejected plan and prevents implementation', async () => {
+    const workflow = new AutoSdlcWorkflow({
+      projectPath,
+      profilePath,
+      stateDir: path.join(temporaryRoot, 'state'),
+      agentFactory: () => new FakeAgent(),
+    });
+    const planned = await workflow.start(task);
+    const rejected = await workflow.rejectPlan(
+      planned.id,
+      'Bob Reviewer',
+      'The file scope is too broad.'
+    );
+    expect(rejected.status).toBe('PLAN_REJECTED');
+    expect(rejected.approval?.decision).toBe('rejected');
+    await expect(workflow.continue(rejected.id, false)).rejects.toThrow('cannot continue');
+  });
+
+  test('persists only the first concurrent approval decision', async () => {
+    const stateDir = path.join(temporaryRoot, 'state');
+    const workflow = new AutoSdlcWorkflow({
+      projectPath,
+      profilePath,
+      stateDir,
+      agentFactory: () => new FakeAgent(),
+    });
+    const planned = await workflow.start(task);
+    const decisions = await Promise.allSettled([
+      workflow.approvePlan(planned.id, 'Alice Reviewer'),
+      workflow.rejectPlan(planned.id, 'Bob Reviewer', 'The scope needs revision.'),
+    ]);
+    expect(decisions.filter((decision) => decision.status === 'fulfilled')).toHaveLength(1);
+    expect(decisions.filter((decision) => decision.status === 'rejected')).toHaveLength(1);
+    const persisted = await workflow.status(planned.id);
+    const artifact = JSON.parse(
+      await readFile(path.join(stateDir, 'runs', planned.id, 'approval.json'), 'utf8')
+    );
+    expect(persisted.approval).toEqual(artifact);
+    const eventLines = (
+      await readFile(path.join(stateDir, 'runs', planned.id, 'events.jsonl'), 'utf8')
+    )
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter((event) => event.type === 'plan.approved' || event.type === 'plan.rejected');
+    expect(eventLines).toHaveLength(1);
+  });
+
+  test('reconciles an approval artifact left by interrupted persistence', async () => {
+    const stateDir = path.join(temporaryRoot, 'state');
+    const workflow = new AutoSdlcWorkflow({
+      projectPath,
+      profilePath,
+      stateDir,
+      agentFactory: () => new FakeAgent(),
+    });
+    const planned = await workflow.start(task);
+    const approval = {
+      decision: 'approved',
+      actor: 'Interrupted Reviewer',
+      note: 'The decision reached disk first.',
+      decidedAt: '2026-09-15T12:00:00.000Z',
+      planHash: createHash('sha256')
+        .update(planned.plan as string)
+        .digest('hex'),
+      profileHash: planned.profileHash,
+      baseSha: planned.baseSha,
+    };
+    await writeFile(
+      path.join(stateDir, 'runs', planned.id, 'approval.json'),
+      JSON.stringify(approval),
+      'utf8'
+    );
+
+    const reconciled = await workflow.approvePlan(planned.id, 'Interrupted Reviewer');
+    expect(reconciled.status).toBe('PLAN_APPROVED');
+    expect(reconciled.approval).toEqual(approval);
+    expect((await workflow.continue(planned.id, false)).status).toBe('READY_FOR_PR');
+  });
+
+  test('migrates legacy approval evidence before resuming an interrupted run', async () => {
+    const stateDir = path.join(temporaryRoot, 'state');
+    const workflow = new AutoSdlcWorkflow({
+      projectPath,
+      profilePath,
+      stateDir,
+      agentFactory: () => new FakeAgent(),
+    });
+    const planned = await workflow.start(task);
+    const runPath = path.join(stateDir, 'runs', planned.id, 'run.json');
+    const legacy = JSON.parse(await readFile(runPath, 'utf8'));
+    legacy.version = 1;
+    legacy.status = 'VERIFYING';
+    delete legacy.approval;
+    await writeFile(runPath, JSON.stringify(legacy), 'utf8');
+    await writeFile(
+      path.join(stateDir, 'runs', planned.id, 'events.jsonl'),
+      `${JSON.stringify({
+        timestamp: '2026-09-15T12:00:00.000Z',
+        runId: planned.id,
+        type: 'plan.approved',
+        status: 'IMPLEMENTING',
+      })}\n`,
+      { encoding: 'utf8', flag: 'a' }
+    );
+
+    const resumed = await workflow.continue(planned.id, false);
+    expect(resumed.status).toBe('READY_FOR_PR');
+    expect(resumed.version).toBe(2);
+    expect(resumed.approval).toMatchObject({
+      decision: 'approved',
+      actor: 'Legacy CLI operator',
+      decidedAt: '2026-09-15T12:00:00.000Z',
+    });
+  });
+
+  test('invalidates approval when the approved plan is changed', async () => {
+    const stateDir = path.join(temporaryRoot, 'state');
+    const workflow = new AutoSdlcWorkflow({
+      projectPath,
+      profilePath,
+      stateDir,
+      agentFactory: () => new FakeAgent(),
+    });
+    const planned = await workflow.start(task);
+    const approved = await workflow.approvePlan(planned.id, 'Alice Reviewer');
+    const runPath = path.join(stateDir, 'runs', approved.id, 'run.json');
+    const tampered = JSON.parse(await readFile(runPath, 'utf8'));
+    tampered.plan = JSON.stringify({
+      ...JSON.parse(tampered.plan),
+      expectedFiles: ['**'],
+    });
+    await writeFile(runPath, JSON.stringify(tampered), 'utf8');
+    await expect(workflow.continue(approved.id, false)).rejects.toThrow('valid approval');
+    expect((await workflow.status(approved.id)).status).toBe('FAILED');
+  });
+
   test('rejects a profile without deterministic verification checks', async () => {
     profile.checks = [];
     await writeFile(profilePath, JSON.stringify(profile), 'utf8');
@@ -216,10 +394,7 @@ describe('AutoSdlcWorkflow MVP', () => {
       {
         name: 'mutating-check',
         command: 'node',
-        args: [
-          '-e',
-          "require('fs').writeFileSync('src/value.txt', 'changed-by-check\\n')",
-        ],
+        args: ['-e', "require('fs').writeFileSync('src/value.txt', 'changed-by-check\\n')"],
       },
     ];
     await writeFile(profilePath, JSON.stringify(profile), 'utf8');
@@ -239,8 +414,12 @@ describe('AutoSdlcWorkflow MVP', () => {
   test('rejects a blocked rename even when its destination is allowed by the plan', async () => {
     await mkdir(path.join(projectPath, 'blocked'));
     await writeFile(path.join(projectPath, 'blocked', 'secret.txt'), 'secret\n', 'utf8');
-    await requireSuccess('git', ['add', 'blocked/secret.txt'], { cwd: projectPath });
-    await requireSuccess('git', ['commit', '-m', 'add blocked fixture'], { cwd: projectPath });
+    await requireSuccess('git', ['add', 'blocked/secret.txt'], {
+      cwd: projectPath,
+    });
+    await requireSuccess('git', ['commit', '-m', 'add blocked fixture'], {
+      cwd: projectPath,
+    });
     profile.allowedPaths = ['allowed/**'];
     profile.blockedPaths = ['blocked/**'];
     await writeFile(profilePath, JSON.stringify(profile), 'utf8');
@@ -267,7 +446,11 @@ describe('AutoSdlcWorkflow MVP', () => {
           return { output: 'Moved.', command: ['fake-agent', 'implement'] };
         }
         return {
-          output: JSON.stringify({ verdict: 'pass', summary: 'Pass.', findings: [] }),
+          output: JSON.stringify({
+            verdict: 'pass',
+            summary: 'Pass.',
+            findings: [],
+          }),
           command: ['fake-agent', 'review'],
         };
       },
@@ -293,7 +476,10 @@ describe('AutoSdlcWorkflow MVP', () => {
           await mkdir(path.join(request.workspace, 'src'), { recursive: true });
           await writeFile(path.join(request.workspace, 'src', 'value.txt'), 'ready\n', 'utf8');
           await writeFile(path.join(request.workspace, 'src', 'extra.txt'), 'unexpected\n', 'utf8');
-          return { output: 'Implemented with an extra file.', command: ['fake-agent', 'implement'] };
+          return {
+            output: 'Implemented with an extra file.',
+            command: ['fake-agent', 'implement'],
+          };
         }
         return new FakeAgent().run(request);
       },
@@ -313,13 +499,18 @@ describe('AutoSdlcWorkflow MVP', () => {
   test('rejects implementation changes to ignored files', async () => {
     await writeFile(path.join(projectPath, '.gitignore'), '.env\n', 'utf8');
     await requireSuccess('git', ['add', '.gitignore'], { cwd: projectPath });
-    await requireSuccess('git', ['commit', '-m', 'ignore environment file'], { cwd: projectPath });
+    await requireSuccess('git', ['commit', '-m', 'ignore environment file'], {
+      cwd: projectPath,
+    });
     const ignoredFileAgent: AgentRunner = {
       async run(request) {
         if (request.phase === 'implement') {
           await new FakeAgent().run(request);
           await writeFile(path.join(request.workspace, '.env'), 'SECRET=unexpected\n', 'utf8');
-          return { output: 'Implemented with ignored state.', command: ['fake-agent', 'implement'] };
+          return {
+            output: 'Implemented with ignored state.',
+            command: ['fake-agent', 'implement'],
+          };
         }
         return new FakeAgent().run(request);
       },
@@ -339,7 +530,9 @@ describe('AutoSdlcWorkflow MVP', () => {
   test('detects mode-only changes to an existing ignored file', async () => {
     await writeFile(path.join(projectPath, '.gitignore'), '.env\n', 'utf8');
     await requireSuccess('git', ['add', '.gitignore'], { cwd: projectPath });
-    await requireSuccess('git', ['commit', '-m', 'ignore environment file'], { cwd: projectPath });
+    await requireSuccess('git', ['commit', '-m', 'ignore environment file'], {
+      cwd: projectPath,
+    });
     profile.setup = [
       {
         name: 'fixture-env',
@@ -370,7 +563,9 @@ describe('AutoSdlcWorkflow MVP', () => {
   test('requires ignored verification outputs to be declared', async () => {
     await writeFile(path.join(projectPath, '.gitignore'), 'generated.log\n', 'utf8');
     await requireSuccess('git', ['add', '.gitignore'], { cwd: projectPath });
-    await requireSuccess('git', ['commit', '-m', 'ignore generated output'], { cwd: projectPath });
+    await requireSuccess('git', ['commit', '-m', 'ignore generated output'], {
+      cwd: projectPath,
+    });
     profile.checks.push({
       name: 'generate-output',
       command: 'node',
@@ -394,7 +589,9 @@ describe('AutoSdlcWorkflow MVP', () => {
       async run(request) {
         const result = await new FakeAgent().run(request);
         if (request.phase === 'implement') {
-          await requireSuccess('git', ['add', '-A'], { cwd: request.workspace });
+          await requireSuccess('git', ['add', '-A'], {
+            cwd: request.workspace,
+          });
           await requireSuccess('git', ['commit', '-m', 'uncontrolled commit'], {
             cwd: request.workspace,
           });
@@ -436,7 +633,10 @@ describe('AutoSdlcWorkflow MVP', () => {
     profile.allowedPaths = ['Docs/**'];
     await writeFile(profilePath, JSON.stringify(profile), 'utf8');
     const unicodePath = 'Docs/说明\n详情.md';
-    const unicodeTask = { ...task, acceptanceCriteria: [`${unicodePath} exists`] };
+    const unicodeTask = {
+      ...task,
+      acceptanceCriteria: [`${unicodePath} exists`],
+    };
     const unicodeAgent: AgentRunner = {
       async run(request) {
         if (request.phase === 'plan') {
@@ -454,7 +654,10 @@ describe('AutoSdlcWorkflow MVP', () => {
         if (request.phase === 'implement') {
           await mkdir(path.join(request.workspace, 'Docs'));
           await writeFile(path.join(request.workspace, unicodePath), 'ready\n', 'utf8');
-          return { output: 'Added documentation.', command: ['fake-agent', 'implement'] };
+          return {
+            output: 'Added documentation.',
+            command: ['fake-agent', 'implement'],
+          };
         }
         return new FakeAgent().run(request);
       },
@@ -622,12 +825,16 @@ describe('AutoSdlcWorkflow MVP', () => {
     const bareRemote = path.join(temporaryRoot, 'remote.git');
     const fakeBin = path.join(temporaryRoot, 'bin');
     await mkdir(fakeBin);
-    await requireSuccess('git', ['init', '--bare', bareRemote], { cwd: temporaryRoot });
-    await requireSuccess('git', ['remote', 'add', 'origin', bareRemote], { cwd: projectPath });
+    await requireSuccess('git', ['init', '--bare', bareRemote], {
+      cwd: temporaryRoot,
+    });
+    await requireSuccess('git', ['remote', 'add', 'origin', bareRemote], {
+      cwd: projectPath,
+    });
     const fakeGh = path.join(fakeBin, 'gh');
     await writeFile(
       fakeGh,
-      "#!/bin/sh\nif [ \"$2\" = \"view\" ]; then exit 1; fi\nprintf '%s\\n' 'https://example.test/pull/1'\n",
+      '#!/bin/sh\nif [ "$2" = "view" ]; then exit 1; fi\nprintf \'%s\\n\' \'https://example.test/pull/1\'\n',
       'utf8'
     );
     await chmod(fakeGh, 0o755);
@@ -648,7 +855,9 @@ describe('AutoSdlcWorkflow MVP', () => {
       const remote = await requireSuccess(
         'git',
         ['ls-remote', '--heads', 'origin', `refs/heads/${published.branch}`],
-        { cwd: projectPath }
+        {
+          cwd: projectPath,
+        }
       );
       expect(remote.stdout).toContain(`refs/heads/${published.branch}`);
     } finally {
@@ -665,6 +874,7 @@ describe('AutoSdlcWorkflow MVP', () => {
       agentFactory: () => new FakeAgent(),
     });
     const planned = await workflow.start(task);
+    await workflow.approvePlan(planned.id, 'Recovery Test');
     const runPath = path.join(stateDir, 'runs', planned.id, 'run.json');
     const interrupted = JSON.parse(await readFile(runPath, 'utf8'));
     interrupted.status = 'VERIFYING';

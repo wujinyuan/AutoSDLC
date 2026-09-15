@@ -6,6 +6,7 @@ import { AgentRunner, CodexCliAgent } from './agent';
 import { requireSuccess, runProcess } from './process';
 import {
   CheckResult,
+  PlanApproval,
   ProjectProfile,
   ReviewResult,
   RunRecord,
@@ -73,7 +74,10 @@ function toPosix(value: string): string {
 }
 
 function nulPaths(output: string): string[] {
-  return output.split('\0').filter((item) => item.length > 0).map(toPosix);
+  return output
+    .split('\0')
+    .filter((item) => item.length > 0)
+    .map(toPosix);
 }
 
 function globMatches(file: string, pattern: string): boolean {
@@ -124,10 +128,7 @@ export class AutoSdlcWorkflow {
   private readonly profilePath: string;
   private readonly stateDir: string;
   private readonly store: RunStore;
-  private readonly agentFactory: (
-    profile: ProjectProfile,
-    artifactDir: string
-  ) => AgentRunner;
+  private readonly agentFactory: (profile: ProjectProfile, artifactDir: string) => AgentRunner;
 
   constructor(options: WorkflowOptions) {
     this.projectPath = path.resolve(options.projectPath);
@@ -159,7 +160,9 @@ export class AutoSdlcWorkflow {
       (profile.verificationOutputPaths !== undefined &&
         !Array.isArray(profile.verificationOutputPaths))
     ) {
-      throw new Error('Invalid project profile: version, name, baseBranch, allowedPaths and checks are required.');
+      throw new Error(
+        'Invalid project profile: version, name, baseBranch, allowedPaths and checks are required.'
+      );
     }
   }
 
@@ -174,11 +177,131 @@ export class AutoSdlcWorkflow {
     return profile;
   }
 
+  private assertOwnership(record: RunRecord): void {
+    if (record.projectPath !== this.projectPath || record.profilePath !== this.profilePath) {
+      throw new Error('Run project/profile does not match the current command.');
+    }
+  }
+
+  private planHash(record: RunRecord): string {
+    if (!record.plan) throw new Error('Run has no plan to approve.');
+    return createHash('sha256').update(record.plan).digest('hex');
+  }
+
+  private validateApprovalBinding(record: RunRecord, approval: PlanApproval): void {
+    if (
+      !['approved', 'rejected'].includes(approval.decision) ||
+      !approval.actor?.trim() ||
+      !approval.decidedAt ||
+      approval.planHash !== this.planHash(record) ||
+      approval.profileHash !== record.profileHash ||
+      approval.baseSha !== record.baseSha
+    ) {
+      throw new Error(
+        'Run does not have a valid approval bound to its plan, profile, and base commit.'
+      );
+    }
+  }
+
+  private validateApproval(record: RunRecord): void {
+    const approval = record.approval;
+    if (!approval || approval.decision !== 'approved') {
+      throw new Error(
+        'Run does not have a valid approval bound to its plan, profile, and base commit.'
+      );
+    }
+    this.validateApprovalBinding(record, approval);
+  }
+
+  private async reconcileApprovalArtifact(record: RunRecord): Promise<PlanApproval | undefined> {
+    let approval: PlanApproval;
+    try {
+      approval = JSON.parse(
+        await readFile(this.store.artifactPath(record.id, 'approval.json'), 'utf8')
+      ) as PlanApproval;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+    this.validateApprovalBinding(record, approval);
+    record.version = 2;
+    record.approval = approval;
+    record.status = approval.decision === 'approved' ? 'PLAN_APPROVED' : 'PLAN_REJECTED';
+    record.error =
+      approval.decision === 'rejected' ? `Plan rejected by ${approval.actor}.` : undefined;
+    await this.store.save(record);
+    await this.store.event(record, 'approval.reconciled', {
+      decision: approval.decision,
+      actor: approval.actor,
+      note: approval.note,
+      planHash: approval.planHash,
+      reconciled: true,
+    });
+    return approval;
+  }
+
+  private async ensureApproval(record: RunRecord): Promise<void> {
+    if (record.approval) {
+      this.validateApproval(record);
+      return;
+    }
+    if (record.version !== 1 || !record.plan) {
+      this.validateApproval(record);
+      return;
+    }
+    const legacyEvent = (await this.store.events(record.id)).find(
+      (event) => event.type === 'plan.approved'
+    );
+    if (!legacyEvent) {
+      this.validateApproval(record);
+      return;
+    }
+    record.approval = {
+      decision: 'approved',
+      actor: 'Legacy CLI operator',
+      note: 'Migrated from the pre-Web plan.approved audit event.',
+      decidedAt: legacyEvent.timestamp,
+      planHash: this.planHash(record),
+      profileHash: record.profileHash,
+      baseSha: record.baseSha,
+    };
+    record.version = 2;
+    try {
+      await this.store.createArtifact(
+        record.id,
+        'approval.json',
+        `${JSON.stringify(record.approval, null, 2)}\n`
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const reconciled = await this.reconcileApprovalArtifact(record);
+      if (!reconciled) throw error;
+      this.validateApproval(record);
+      return;
+    }
+    await this.store.save(record);
+    await this.store.event(record, 'approval.migrated', {
+      sourceEvent: legacyEvent.type,
+      planHash: record.approval.planHash,
+    });
+  }
+
   async start(task: TaskInput): Promise<RunRecord> {
+    if (
+      !task.title?.trim() ||
+      !task.description?.trim() ||
+      !Array.isArray(task.acceptanceCriteria) ||
+      task.acceptanceCriteria.length === 0 ||
+      task.acceptanceCriteria.some((item) => typeof item !== 'string' || !item.trim())
+    ) {
+      throw new Error('Task requires a title, description, and at least one acceptance criterion.');
+    }
     const profile = await this.profile();
     await access(this.projectPath);
     const root = (
-      await requireSuccess('git', ['rev-parse', '--show-toplevel'], { cwd: this.projectPath })
+      await requireSuccess('git', ['rev-parse', '--show-toplevel'], {
+        cwd: this.projectPath,
+      })
     ).stdout.trim();
     if ((await realpath(root)) !== (await realpath(this.projectPath))) {
       throw new Error(`Project path must be the Git root: ${root}`);
@@ -188,15 +311,23 @@ export class AutoSdlcWorkflow {
         cwd: this.projectPath,
       })
     ).stdout.trim();
-    if (dirty) throw new Error('Project worktree has tracked changes; commit or stash them before starting.');
+    if (dirty)
+      throw new Error(
+        'Project worktree has tracked changes; commit or stash them before starting.'
+      );
 
     await requireSuccess('git', ['show-ref', '--verify', `refs/heads/${profile.baseBranch}`], {
       cwd: this.projectPath,
     });
     const baseSha = (
-      await requireSuccess('git', ['rev-parse', profile.baseBranch], { cwd: this.projectPath })
+      await requireSuccess('git', ['rev-parse', profile.baseBranch], {
+        cwd: this.projectPath,
+      })
     ).stdout.trim();
-    const id = `${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${randomUUID().slice(0, 8)}`;
+    const id = `${new Date()
+      .toISOString()
+      .replace(/[-:.TZ]/g, '')
+      .slice(0, 14)}-${randomUUID().slice(0, 8)}`;
     const projectKey = createHash('sha256').update(this.projectPath).digest('hex').slice(0, 10);
     const worktreePath = path.join(os.tmpdir(), 'autosdlc-worktrees', projectKey, id);
     const branch = `autosdlc/${id}`;
@@ -208,7 +339,7 @@ export class AutoSdlcWorkflow {
     const now = new Date().toISOString();
     const profileHash = createHash('sha256').update(JSON.stringify(profile)).digest('hex');
     const record: RunRecord = {
-      version: 1,
+      version: 2,
       id,
       projectPath: this.projectPath,
       profilePath: this.profilePath,
@@ -247,7 +378,9 @@ export class AutoSdlcWorkflow {
       record.status = 'AWAITING_PLAN_APPROVAL';
       await this.store.writeArtifact(id, 'plan.json', `${record.plan}\n`);
       await this.store.save(record);
-      await this.store.event(record, 'plan.proposed', { agentCommand: result.command });
+      await this.store.event(record, 'plan.proposed', {
+        agentCommand: result.command,
+      });
       return record;
     } catch (error) {
       record.status = 'FAILED';
@@ -258,19 +391,91 @@ export class AutoSdlcWorkflow {
     }
   }
 
-  async continue(runId: string, approvePlan: boolean): Promise<RunRecord> {
+  async approvePlan(runId: string, actor: string, note?: string): Promise<RunRecord> {
+    return this.decidePlan(runId, 'approved', actor, note);
+  }
+
+  async rejectPlan(runId: string, actor: string, note: string): Promise<RunRecord> {
+    if (!note.trim()) throw new Error('A rejection note is required.');
+    return this.decidePlan(runId, 'rejected', actor, note);
+  }
+
+  private async decidePlan(
+    runId: string,
+    decision: PlanApproval['decision'],
+    actor: string,
+    note?: string
+  ): Promise<RunRecord> {
     const record = await this.store.load(runId);
-    const profile = await this.runProfile(record);
-    if (record.projectPath !== this.projectPath || record.profilePath !== this.profilePath) {
-      throw new Error('Run project/profile does not match the current command.');
+    this.assertOwnership(record);
+    await this.runProfile(record);
+    if (!record.approval) {
+      const reconciled = await this.reconcileApprovalArtifact(record);
+      if (reconciled) {
+        if (reconciled.decision !== decision) {
+          throw new Error(
+            `Plan was already ${reconciled.decision}. Reload the run to see the recorded decision.`
+          );
+        }
+        return record;
+      }
     }
+    if (record.status !== 'AWAITING_PLAN_APPROVAL') {
+      throw new Error(
+        `Only AWAITING_PLAN_APPROVAL runs can be decided; current status is ${record.status}.`
+      );
+    }
+    if (!actor.trim()) throw new Error('Approval actor is required.');
+    const approval: PlanApproval = {
+      decision,
+      actor: actor.trim(),
+      note: note?.trim() || undefined,
+      decidedAt: new Date().toISOString(),
+      planHash: this.planHash(record),
+      profileHash: record.profileHash,
+      baseSha: record.baseSha,
+    };
+    try {
+      await this.store.createArtifact(
+        runId,
+        'approval.json',
+        `${JSON.stringify(approval, null, 2)}\n`
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        const reconciled = await this.reconcileApprovalArtifact(record);
+        if (reconciled?.decision === decision) return record;
+        throw new Error(`Plan was already ${reconciled?.decision ?? 'decided'}. Reload the run.`);
+      }
+      throw error;
+    }
+    record.version = 2;
+    record.approval = approval;
+    record.status = decision === 'approved' ? 'PLAN_APPROVED' : 'PLAN_REJECTED';
+    record.error = decision === 'rejected' ? `Plan rejected by ${approval.actor}.` : undefined;
+    await this.store.save(record);
+    await this.store.event(record, `plan.${decision}`, {
+      actor: record.approval.actor,
+      note: record.approval.note,
+      planHash: record.approval.planHash,
+    });
+    return record;
+  }
+
+  async continue(runId: string, approvePlan: boolean): Promise<RunRecord> {
+    let record = await this.store.load(runId);
+    this.assertOwnership(record);
+    const profile = await this.runProfile(record);
     await access(record.worktreePath);
-    if (record.status === 'AWAITING_PLAN_APPROVAL' && !approvePlan) {
-      throw new Error('Plan approval is required. Re-run with --approve-plan after reviewing plan.json.');
+    if (record.status === 'AWAITING_PLAN_APPROVAL') {
+      if (!approvePlan) {
+        throw new Error('Plan approval is required. Approve it before continuing.');
+      }
+      record = await this.approvePlan(runId, 'CLI operator');
     }
     const previousStatus = record.status;
     const resumable = [
-      'AWAITING_PLAN_APPROVAL',
+      'PLAN_APPROVED',
       'IMPLEMENTING',
       'VERIFYING',
       'REVIEWING',
@@ -285,6 +490,17 @@ export class AutoSdlcWorkflow {
     if (!record.plan) {
       throw new Error('Run has no approved plan and cannot continue. Start a new run.');
     }
+    try {
+      await this.ensureApproval(record);
+    } catch (error) {
+      record.status = 'FAILED';
+      record.error = error instanceof Error ? error.message : String(error);
+      await this.store.save(record);
+      await this.store.event(record, 'approval.invalid', {
+        error: record.error,
+      });
+      throw error;
+    }
     if (['IMPLEMENTING', 'VERIFYING', 'REVIEWING'].includes(previousStatus)) {
       record.error = `Recovered from an interrupted ${previousStatus} stage; replaying implementation and verification.`;
     }
@@ -292,12 +508,9 @@ export class AutoSdlcWorkflow {
     record.status = 'IMPLEMENTING';
     await this.store.save(record);
     await this.store.event(record, 'implementation.started', {
-      approvedPlan: approvePlan,
+      approval: record.approval,
       retryFrom: previousStatus,
     });
-    if (previousStatus === 'AWAITING_PLAN_APPROVAL') {
-      await this.store.event(record, 'plan.approved');
-    }
 
     try {
       if (profile.setup && profile.setup.length > 0) {
@@ -368,10 +581,16 @@ export class AutoSdlcWorkflow {
       await this.store.save(record);
       await requireSuccess('git', ['add', '-A'], { cwd: record.worktreePath });
       const verificationInputTree = (
-        await requireSuccess('git', ['write-tree'], { cwd: record.worktreePath })
+        await requireSuccess('git', ['write-tree'], {
+          cwd: record.worktreePath,
+        })
       ).stdout.trim();
       record.checks = await this.runCommands(record, profile.checks);
-      await this.store.writeArtifact(runId, 'verification.json', `${JSON.stringify(record.checks, null, 2)}\n`);
+      await this.store.writeArtifact(
+        runId,
+        'verification.json',
+        `${JSON.stringify(record.checks, null, 2)}\n`
+      );
       const failedChecks = record.checks.filter((check) => check.exitCode !== 0);
       if (failedChecks.length > 0) {
         record.status = 'VERIFICATION_FAILED';
@@ -384,11 +603,14 @@ export class AutoSdlcWorkflow {
       }
       await requireSuccess('git', ['add', '-A'], { cwd: record.worktreePath });
       const verificationOutputTree = (
-        await requireSuccess('git', ['write-tree'], { cwd: record.worktreePath })
+        await requireSuccess('git', ['write-tree'], {
+          cwd: record.worktreePath,
+        })
       ).stdout.trim();
       if (verificationOutputTree !== verificationInputTree) {
         record.status = 'VERIFICATION_FAILED';
-        record.error = 'Verification commands changed repository content; checks must be non-mutating.';
+        record.error =
+          'Verification commands changed repository content; checks must be non-mutating.';
         await this.store.save(record);
         await this.store.event(record, 'verification.mutated_tree', {
           inputTree: verificationInputTree,
@@ -422,7 +644,9 @@ export class AutoSdlcWorkflow {
       this.enforcePlanScope(record.changedPaths, record);
       await requireSuccess('git', ['add', '-A'], { cwd: record.worktreePath });
       record.reviewedTree = (
-        await requireSuccess('git', ['write-tree'], { cwd: record.worktreePath })
+        await requireSuccess('git', ['write-tree'], {
+          cwd: record.worktreePath,
+        })
       ).stdout.trim();
 
       record.status = 'REVIEWING';
@@ -434,8 +658,14 @@ export class AutoSdlcWorkflow {
         prompt: this.reviewPrompt(record),
       });
       record.review = JSON.parse(reviewOutput.output) as ReviewResult;
-      await this.store.writeArtifact(runId, 'review.json', `${JSON.stringify(record.review, null, 2)}\n`);
-      const blockingFindings = record.review.findings.filter((finding) => finding.severity !== 'low');
+      await this.store.writeArtifact(
+        runId,
+        'review.json',
+        `${JSON.stringify(record.review, null, 2)}\n`
+      );
+      const blockingFindings = record.review.findings.filter(
+        (finding) => finding.severity !== 'low'
+      );
       const reviewPassed = record.review.verdict === 'pass' && blockingFindings.length === 0;
       record.status = reviewPassed ? 'READY_FOR_PR' : 'REVIEW_FAILED';
       record.error = reviewPassed
@@ -461,12 +691,13 @@ export class AutoSdlcWorkflow {
 
   async publish(runId: string): Promise<RunRecord> {
     const record = await this.store.load(runId);
-    if (record.projectPath !== this.projectPath || record.profilePath !== this.profilePath) {
-      throw new Error('Run project/profile does not match the current command.');
-    }
+    this.assertOwnership(record);
     if (record.status !== 'READY_FOR_PR') {
-      throw new Error(`Only READY_FOR_PR runs can be published; current status is ${record.status}.`);
+      throw new Error(
+        `Only READY_FOR_PR runs can be published; current status is ${record.status}.`
+      );
     }
+    await this.ensureApproval(record);
 
     // Any failure before this point completes invalidates the reviewed evidence. External
     // delivery failures happen afterward and remain retryable from READY_FOR_PR.
@@ -481,14 +712,18 @@ export class AutoSdlcWorkflow {
       await this.enforceBranch(record);
       await requireSuccess('git', ['add', '-A'], { cwd: record.worktreePath });
       const currentTree = (
-        await requireSuccess('git', ['write-tree'], { cwd: record.worktreePath })
+        await requireSuccess('git', ['write-tree'], {
+          cwd: record.worktreePath,
+        })
       ).stdout.trim();
       if (!record.reviewedTree || currentTree !== record.reviewedTree) {
         record.status = 'REVIEW_FAILED';
         throw new Error('Worktree content changed after verification/review; run continue again.');
       }
       const dirty = (
-        await requireSuccess('git', ['status', '--porcelain'], { cwd: record.worktreePath })
+        await requireSuccess('git', ['status', '--porcelain'], {
+          cwd: record.worktreePath,
+        })
       ).stdout.trim();
       if (dirty) {
         await requireSuccess('git', ['commit', '-m', `feat: ${record.task.title}`], {
@@ -496,22 +731,30 @@ export class AutoSdlcWorkflow {
         });
       } else {
         const head = (
-          await requireSuccess('git', ['rev-parse', 'HEAD'], { cwd: record.worktreePath })
+          await requireSuccess('git', ['rev-parse', 'HEAD'], {
+            cwd: record.worktreePath,
+          })
         ).stdout.trim();
         if (head === record.baseSha) throw new Error('There are no changes to publish.');
       }
       await this.enforceBranch(record);
       const committedTree = (
-        await requireSuccess('git', ['rev-parse', 'HEAD^{tree}'], { cwd: record.worktreePath })
+        await requireSuccess('git', ['rev-parse', 'HEAD^{tree}'], {
+          cwd: record.worktreePath,
+        })
       ).stdout.trim();
       const postCommitDirty = (
-        await requireSuccess('git', ['status', '--porcelain'], { cwd: record.worktreePath })
+        await requireSuccess('git', ['status', '--porcelain'], {
+          cwd: record.worktreePath,
+        })
       ).stdout.trim();
       if (committedTree !== record.reviewedTree || postCommitDirty) {
         throw new Error('Commit hooks changed the reviewed content; run continue again.');
       }
       record.commitSha = (
-        await requireSuccess('git', ['rev-parse', 'HEAD'], { cwd: record.worktreePath })
+        await requireSuccess('git', ['rev-parse', 'HEAD'], {
+          cwd: record.worktreePath,
+        })
       ).stdout.trim();
       record.status = 'READY_FOR_PR';
       record.error = undefined;
@@ -519,14 +762,18 @@ export class AutoSdlcWorkflow {
     } catch (error) {
       record.error = error instanceof Error ? error.message : String(error);
       await this.store.save(record);
-      await this.store.event(record, 'publish.preflight_failed', { error: record.error });
+      await this.store.event(record, 'publish.preflight_failed', {
+        error: record.error,
+      });
       throw error;
     }
 
     try {
       const remote = profile.delivery?.remote ?? 'origin';
       const remoteUrl = (
-        await requireSuccess('git', ['remote', 'get-url', remote], { cwd: record.worktreePath })
+        await requireSuccess('git', ['remote', 'get-url', remote], {
+          cwd: record.worktreePath,
+        })
       ).stdout.trim();
       const repository = githubRepositoryFromRemote(remoteUrl);
       await requireSuccess('git', ['push', '-u', remote, `HEAD:refs/heads/${record.branch}`], {
@@ -567,7 +814,9 @@ export class AutoSdlcWorkflow {
       record.status = 'PR_CREATED';
       record.error = undefined;
       await this.store.save(record);
-      await this.store.event(record, 'pull_request.created', { url: record.pullRequestUrl });
+      await this.store.event(record, 'pull_request.created', {
+        url: record.pullRequestUrl,
+      });
       return record;
     } catch (error) {
       record.error = error instanceof Error ? error.message : String(error);
@@ -578,7 +827,35 @@ export class AutoSdlcWorkflow {
   }
 
   async status(runId: string): Promise<RunRecord> {
-    return this.store.load(runId);
+    const record = await this.store.load(runId);
+    this.assertOwnership(record);
+    return record;
+  }
+
+  async listRuns(): Promise<RunRecord[]> {
+    return (await this.store.list()).filter(
+      (record) => record.projectPath === this.projectPath && record.profilePath === this.profilePath
+    );
+  }
+
+  async events(runId: string) {
+    await this.status(runId);
+    return this.store.events(runId);
+  }
+
+  async recordActionFailure(
+    runId: string,
+    action: 'continue' | 'publish',
+    error: unknown
+  ): Promise<void> {
+    const record = await this.store.load(runId);
+    this.assertOwnership(record);
+    const message = error instanceof Error ? error.message : String(error);
+    if (record.error === message) return;
+    record.status = action === 'continue' ? 'FAILED' : 'REVIEW_FAILED';
+    record.error = message;
+    await this.store.save(record);
+    await this.store.event(record, `${action}.background_failed`, { error: message });
   }
 
   private planPrompt(task: TaskInput, profile: ProjectProfile): string {
@@ -636,12 +913,16 @@ export class AutoSdlcWorkflow {
     const tracked = await requireSuccess(
       'git',
       ['diff', '--name-only', '-z', '--no-renames', record.baseSha, '--'],
-      { cwd: record.worktreePath }
+      {
+        cwd: record.worktreePath,
+      }
     );
     const untracked = await requireSuccess(
       'git',
       ['ls-files', '--others', '--exclude-standard', '-z'],
-      { cwd: record.worktreePath }
+      {
+        cwd: record.worktreePath,
+      }
     );
     return [...new Set([...nulPaths(tracked.stdout), ...nulPaths(untracked.stdout)])].sort();
   }
@@ -650,7 +931,9 @@ export class AutoSdlcWorkflow {
     const ignored = await requireSuccess(
       'git',
       ['ls-files', '--others', '--ignored', '--exclude-standard', '-z'],
-      { cwd: record.worktreePath }
+      {
+        cwd: record.worktreePath,
+      }
     );
     const manifest = new Map<string, string>();
     for (const relativePath of nulPaths(ignored.stdout).sort()) {
@@ -681,7 +964,9 @@ export class AutoSdlcWorkflow {
       return !allowed || blocked;
     });
     if (violations.length > 0) {
-      throw new Error(`Implementation changed paths outside the approved scope: ${violations.join(', ')}`);
+      throw new Error(
+        `Implementation changed paths outside the approved scope: ${violations.join(', ')}`
+      );
     }
   }
 
@@ -694,7 +979,9 @@ export class AutoSdlcWorkflow {
       (file) => !plan.expectedFiles?.some((pattern) => globMatches(file, pattern))
     );
     if (unexpected.length > 0) {
-      throw new Error(`Implementation changed files outside the approved plan: ${unexpected.join(', ')}`);
+      throw new Error(
+        `Implementation changed files outside the approved plan: ${unexpected.join(', ')}`
+      );
     }
   }
 
@@ -711,7 +998,9 @@ export class AutoSdlcWorkflow {
 
   private async enforceBaseHead(record: RunRecord): Promise<void> {
     const head = (
-      await requireSuccess('git', ['rev-parse', 'HEAD'], { cwd: record.worktreePath })
+      await requireSuccess('git', ['rev-parse', 'HEAD'], {
+        cwd: record.worktreePath,
+      })
     ).stdout.trim();
     if (head !== record.baseSha) {
       throw new Error('Run branch contains commits created outside the controlled publish stage.');
@@ -720,14 +1009,19 @@ export class AutoSdlcWorkflow {
 
   private async enforcePublishHead(record: RunRecord): Promise<void> {
     const head = (
-      await requireSuccess('git', ['rev-parse', 'HEAD'], { cwd: record.worktreePath })
+      await requireSuccess('git', ['rev-parse', 'HEAD'], {
+        cwd: record.worktreePath,
+      })
     ).stdout.trim();
     if (head !== record.baseSha && head !== record.commitSha) {
       throw new Error('Run branch contains commits created outside the controlled publish stage.');
     }
   }
 
-  private async runCommands(record: RunRecord, commands: ProjectProfile['checks']): Promise<CheckResult[]> {
+  private async runCommands(
+    record: RunRecord,
+    commands: ProjectProfile['checks']
+  ): Promise<CheckResult[]> {
     const results: CheckResult[] = [];
     for (const check of commands) {
       const result = await runProcess(check.command, check.args ?? [], {
@@ -745,8 +1039,6 @@ export class AutoSdlcWorkflow {
       .join('\n');
     return `## AutoSDLC run\n\nRun: \`${record.id}\`\nBase: \`${record.baseSha}\`\n\n## Task\n\n${
       record.task.description
-    }\n\n## Verification\n\n${checks}\n\n## Independent review\n\n${
-      record.review?.summary ?? 'Not available'
-    }\n`;
+    }\n\n## Verification\n\n${checks}\n\n## Independent review\n\n${record.review?.summary ?? 'Not available'}\n`;
   }
 }

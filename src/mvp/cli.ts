@@ -3,6 +3,7 @@ import { readFile } from 'fs/promises';
 import path from 'path';
 import { AutoSdlcWorkflow } from './workflow';
 import { TaskInput } from './types';
+import { startConsoleServer } from '../web/console-server';
 
 interface ParsedArgs {
   command: string;
@@ -47,6 +48,7 @@ Usage:
   autosdlc continue --project <git-root> --profile <profile.json> --run <id> --approve-plan
   autosdlc status --project <git-root> --profile <profile.json> --run <id>
   autosdlc publish --project <git-root> --profile <profile.json> --run <id>
+  autosdlc web --project <git-root> --profile <profile.json> [--port 4177]
 
 The start command creates an isolated Git worktree and proposes a plan. It never
 implements before an explicit continue --approve-plan. Publish creates a commit,
@@ -68,6 +70,21 @@ async function main(): Promise<void> {
     stateDir: typeof stateValue === 'string' ? path.resolve(stateValue) : undefined,
   });
 
+  if (args.command === 'web') {
+    const portValue = args.values.get('port');
+    const port = typeof portValue === 'string' ? Number(portValue) : 4177;
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error('--port must be an integer between 1 and 65535.');
+    }
+    await startConsoleServer({
+      workflow,
+      metadata: { projectPath: project, profilePath: profile },
+      port,
+    });
+    console.log(`AutoSDLC console: http://127.0.0.1:${port}`);
+    return;
+  }
+
   if (args.command === 'start') {
     const taskPath = path.resolve(required(args, 'task'));
     const task = JSON.parse(await readFile(taskPath, 'utf8')) as TaskInput;
@@ -77,7 +94,9 @@ async function main(): Promise<void> {
     const run = await workflow.start(task);
     console.log(JSON.stringify(run, null, 2));
     console.log(`\nReview: ${path.join(run.stateDir, 'runs', run.id, 'plan.json')}`);
-    console.log(`Continue: autosdlc continue --project ${project} --profile ${profile} --run ${run.id} --approve-plan`);
+    console.log(
+      `Continue: autosdlc continue --project ${project} --profile ${profile} --run ${run.id} --approve-plan`
+    );
     return;
   }
 
