@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="AutoSDLC 本地运行控制台与人工审批工作台"
+    />
+    <title>AutoSDLC Control Room</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-block">
+          <div class="brand-mark" aria-hidden="true">A</div>
+          <div>
+            <div class="brand-name">AutoSDLC</div>
+            <div class="brand-context" id="project-name">连接项目中</div>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <span class="connection"
+            ><span class="connection-dot"></span>本地控制面</span
+          >
+          <button
+            class="button button-primary"
+            id="new-run-button"
+            type="button"
+          >
+            新建运行
+          </button>
+        </div>
+      </header>
+
+      <div class="workspace">
+        <aside class="run-rail" aria-label="运行列表">
+          <div class="rail-heading">
+            <div>
+              <div class="eyebrow">RUNS</div>
+              <h1>交付运行</h1>
+            </div>
+            <span class="count-badge" id="run-count">0</span>
+          </div>
+          <div class="filter-row" role="group" aria-label="运行筛选">
+            <button
+              class="filter-chip is-active"
+              data-filter="all"
+              type="button"
+            >
+              全部
+            </button>
+            <button class="filter-chip" data-filter="attention" type="button">
+              待处理
+            </button>
+            <button class="filter-chip" data-filter="active" type="button">
+              运行中
+            </button>
+          </div>
+          <div class="run-list" id="run-list">
+            <div class="empty-rail">还没有运行</div>
+          </div>
+        </aside>
+
+        <main class="main-panel" id="main-panel">
+          <section class="empty-state" id="empty-state">
+            <div class="empty-glyph" aria-hidden="true">01</div>
+            <p class="eyebrow">CONTROL ROOM</p>
+            <h2>从一个可审查的计划开始</h2>
+            <p>
+              提交任务后，系统先生成只读计划。任何代码变更都必须经过人工批准。
+            </p>
+            <button
+              class="button button-primary"
+              id="empty-new-run"
+              type="button"
+            >
+              创建第一次运行
+            </button>
+          </section>
+
+          <section
+            class="run-detail is-hidden"
+            id="run-detail"
+            aria-live="polite"
+          >
+            <div class="detail-header">
+              <div>
+                <div class="detail-kicker">
+                  <span id="run-id">RUN</span>
+                  <span class="status-pill" id="run-status">—</span>
+                  <span class="active-indicator is-hidden" id="active-indicator"
+                    >执行中</span
+                  >
+                </div>
+                <h2 id="run-title">—</h2>
+                <p id="run-description">—</p>
+              </div>
+              <div class="detail-actions" id="detail-actions"></div>
+            </div>
+
+            <div class="alert is-hidden" id="run-alert"></div>
+
+            <div class="metric-grid">
+              <article class="metric-card">
+                <span>当前关卡</span>
+                <strong id="current-gate">—</strong>
+              </article>
+              <article class="metric-card">
+                <span>变更文件</span>
+                <strong id="changed-count">0</strong>
+              </article>
+              <article class="metric-card">
+                <span>确定性检查</span>
+                <strong id="check-score">—</strong>
+              </article>
+              <article class="metric-card">
+                <span>独立审查</span>
+                <strong id="review-score">未开始</strong>
+              </article>
+            </div>
+
+            <div class="content-grid">
+              <div class="primary-column">
+                <section class="panel plan-panel">
+                  <div class="panel-heading">
+                    <div>
+                      <p class="eyebrow">APPROVED SCOPE</p>
+                      <h3>实施计划</h3>
+                    </div>
+                    <span class="hash-label" id="base-sha">—</span>
+                  </div>
+                  <div id="plan-content" class="plan-content"></div>
+                </section>
+
+                <section class="panel">
+                  <div class="panel-heading">
+                    <div>
+                      <p class="eyebrow">EVIDENCE</p>
+                      <h3>检查与审查</h3>
+                    </div>
+                  </div>
+                  <div id="evidence-content" class="evidence-content"></div>
+                </section>
+              </div>
+
+              <div class="secondary-column">
+                <section class="panel approval-panel" id="approval-panel">
+                  <div class="panel-heading">
+                    <div>
+                      <p class="eyebrow">HUMAN GATE</p>
+                      <h3>人工审批</h3>
+                    </div>
+                  </div>
+                  <div id="approval-content"></div>
+                </section>
+
+                <section class="panel">
+                  <div class="panel-heading">
+                    <div>
+                      <p class="eyebrow">AUDIT TRAIL</p>
+                      <h3>运行时间线</h3>
+                    </div>
+                  </div>
+                  <ol class="timeline" id="timeline"></ol>
+                </section>
+              </div>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <dialog class="task-dialog" id="task-dialog">
+      <form method="dialog" id="task-form">
+        <div class="dialog-header">
+          <div>
+            <p class="eyebrow">NEW RUN</p>
+            <h2>定义交付任务</h2>
+          </div>
+          <button
+            class="icon-button"
+            value="cancel"
+            aria-label="关闭"
+            type="submit"
+          >
+            ×
+          </button>
+        </div>
+        <label
+          >任务标题<input
+            name="title"
+            maxlength="120"
+            required
+            placeholder="例如：为健康检查增加版本字段"
+        /></label>
+        <label
+          >问题与目标<textarea
+            name="description"
+            rows="4"
+            required
+            placeholder="说明当前问题、期望结果和必要约束"
+          ></textarea>
+        </label>
+        <label
+          >验收标准 <span>每行一条</span
+          ><textarea
+            name="acceptanceCriteria"
+            rows="5"
+            required
+            placeholder="响应包含 serviceVersion&#10;字段值与 package.json 一致"
+          ></textarea>
+        </label>
+        <label
+          >非目标 <span>可选，每行一条</span
+          ><textarea
+            name="nonGoals"
+            rows="3"
+            placeholder="不修改部署配置"
+          ></textarea>
+        </label>
+        <div class="dialog-actions">
+          <button class="button button-ghost" value="cancel" type="submit">
+            取消
+          </button>
+          <button
+            class="button button-primary"
+            id="create-run-submit"
+            value="default"
+            type="submit"
+          >
+            生成计划
+          </button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast is-hidden" id="toast" role="status"></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

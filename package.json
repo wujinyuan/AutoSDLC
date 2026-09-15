@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Autonomous Software Development Lifecycle - AI-powered multi-agent development system",
   "main": "dist/index.js",
+  "bin": {
+    "autosdlc": "dist/src/mvp/cli.js"
+  },
   "scripts": {
     "dev": "npm run build && npm run docker:deps && sleep 10 && npm run db:migrate && npm run mcp:server",
     "build": "tsc",
@@ -21,7 +24,10 @@
     "agents:start": "npm run agents:init && npm run agents:start:cc",
     "agents:start:cc": "concurrently \"cc -p agents/customer-agent\" \"cc -p agents/pm-agent\" \"cc -p agents/coder-agent\" \"cc -p agents/reviewer-agent\" \"cc -p agents/tester-agent\"",
     "lint": "eslint src tests --ext .ts",
-    "format": "prettier --write src tests"
+    "format": "prettier --write src tests",
+    "mvp": "npm run build && node dist/src/mvp/cli.js",
+    "mvp:help": "npm run mvp -- help",
+    "web": "npm run build && node dist/src/mvp/cli.js web"
   },
   "keywords": [
     "ai",

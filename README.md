@@ -16,6 +16,25 @@
 
 ## 🚀 Quick Start
 
+### Runnable AutoSDLC MVP
+
+The repository now includes a minimal real delivery loop built around Git
+worktree isolation, an authenticated Codex CLI, deterministic project checks,
+independent review, persisted evidence, and optional Draft PR creation. Start with
+[the runnable MVP guide](Docs/70-Runnable-MVP.md). The older five-agent Phase 2
+framework remains available as an experimental architecture.
+
+The same workflow is available through a local operator console with durable
+human plan approval:
+
+```bash
+npm run web -- --project "$PWD" --profile examples/mvp/project.json
+```
+
+Open `http://127.0.0.1:4177`. See the
+[Web console and approval guide](Docs/71-Web-Console.md) for the trust boundary
+and operator flow.
+
 ### Prerequisites
 - Node.js 20+
 - Docker & Docker Compose
