@@ -6,6 +6,7 @@
  */
 
 import request from 'supertest';
+import packageMetadata from '../../package.json';
 import { MCPServer } from '../../src/core/mcp-server';
 
 describe('MCP Server', () => {
@@ -37,6 +38,7 @@ describe('MCP Server', () => {
         status: 'healthy',
         timestamp: expect.any(String),
         version: expect.any(String),
+        serviceVersion: expect.any(String),
         uptime: expect.any(Number)
       });
     });
@@ -48,6 +50,8 @@ describe('MCP Server', () => {
 
       expect(response.body.status).toBe('healthy');
       expect(response.body.timestamp).toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+      expect(response.body.version).toBe(packageMetadata.version);
+      expect(response.body.serviceVersion).toBe(packageMetadata.version);
       expect(response.body.uptime).toBeGreaterThanOrEqual(0);
     });
   });
