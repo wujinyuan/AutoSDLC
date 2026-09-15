@@ -6,6 +6,7 @@
 
 import express, { Express, Request, Response, NextFunction } from 'express';
 import { Server } from 'http';
+import packageMetadata from '../../package.json';
 import { MCPServerConfig } from '../types/config';
 
 export class MCPServer {
@@ -59,7 +60,8 @@ export class MCPServer {
       res.status(200).json({
         status: 'healthy',
         timestamp: new Date().toISOString(),
-        version: '0.1.0', // TODO: Get from package.json
+        version: packageMetadata.version,
+        serviceVersion: packageMetadata.version,
         uptime: uptime
       });
     });

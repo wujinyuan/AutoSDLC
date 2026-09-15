@@ -265,6 +265,7 @@ docker-compose ps
     "status": "healthy",
     "timestamp": "2025-06-09T01:05:50.640Z",
     "version": "0.1.0",
+    "serviceVersion": "0.1.0",
     "uptime": 28787
   }
   ```
