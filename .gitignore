@@ -22,6 +22,7 @@ coverage/
 # Logs
 *.log
 logs/
+.autosdlc/
 
 # MCP and Claude local configs
 .mcp.json

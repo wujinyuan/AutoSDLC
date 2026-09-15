@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "name": "autosdlc",
+  "baseBranch": "main",
+  "allowedPaths": [
+    "src/**",
+    "tests/**",
+    "examples/**",
+    "Docs/**",
+    "README.md",
+    "package.json",
+    "package-lock.json",
+    ".gitignore"
+  ],
+  "blockedPaths": [
+    ".github/workflows/**",
+    ".env",
+    ".env.*"
+  ],
+  "setup": [
+    {
+      "name": "install",
+      "command": "npm",
+      "args": ["ci"],
+      "timeoutMs": 600000
+    }
+  ],
+  "checks": [
+    {
+      "name": "build",
+      "command": "npm",
+      "args": ["run", "build"],
+      "timeoutMs": 600000
+    },
+    {
+      "name": "mcp-server-tests",
+      "command": "npx",
+      "args": ["jest", "tests/unit/mcp-server.test.ts", "--runInBand"],
+      "timeoutMs": 600000
+    }
+  ],
+  "verificationOutputPaths": ["dist/**"],
+  "agent": {
+    "executable": "codex"
+  },
+  "delivery": {
+    "remote": "origin"
+  }
+}

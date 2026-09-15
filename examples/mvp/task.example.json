@@ -1,0 +1,14 @@
+{
+  "title": "Add a health-check detail",
+  "description": "Extend the existing health response with a stable serviceVersion field sourced from package metadata.",
+  "acceptanceCriteria": [
+    "The health response contains serviceVersion",
+    "The value matches package.json version",
+    "Existing health response fields remain compatible",
+    "Automated tests cover the new field"
+  ],
+  "nonGoals": [
+    "Changing database health behavior",
+    "Deploying the service"
+  ]
+}
